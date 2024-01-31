@@ -3,6 +3,10 @@ from typing import Optional
 import jax.numpy as jnp
 import numpy as np
 import numpyro
+from diffrax import diffeqsolve
+from diffrax import ODETerm
+from diffrax import SaveAt
+from diffrax import Tsit5
 from jax import random
 from numpyro.distributions import Exponential
 from numpyro.distributions import HalfCauchy
@@ -10,6 +14,7 @@ from numpyro.distributions import InverseGamma
 from numpyro.distributions import Normal
 from numpyro.infer import MCMC
 from numpyro.infer import NUTS
+from numpyro.infer.initialization import init_to_value
 
 from .base import BaseOptimizer
 
@@ -92,6 +97,7 @@ class SBR(BaseOptimizer):
         num_samples: int = 5000,
         mcmc_kwargs: Optional[dict] = None,
         unbias: bool = False,
+        init: Optional[dict] = None,
         **kwargs,
     ):
 
@@ -99,6 +105,8 @@ class SBR(BaseOptimizer):
             raise ValueError("SBR is incompatible with unbiasing. Set unbias=False")
 
         super().__init__(unbias=unbias, **kwargs)
+
+        self.integrator = DiffraxModel()
 
         # set the hyperparameters
         self.sparsity_coef_tau0 = sparsity_coef_tau0
@@ -115,6 +123,8 @@ class SBR(BaseOptimizer):
             self.mcmc_kwargs = mcmc_kwargs
         else:
             self.mcmc_kwargs = {}
+
+        self.init = init
 
     def _reduce(self, x, y):
         # set up a sparse regression and sample.
@@ -139,11 +149,11 @@ class SBR(BaseOptimizer):
 
         # sample the parameters compute the predicted outputs.
         beta = _sample_reg_horseshoe(tau, c_sq, (n_targets, n_features))
-        mu = jnp.dot(x, beta.T)
+        mu = self.integrator.solve(x[0, :n_targets], jnp.linspace(0, 30, 50), beta)
 
         # compute the likelihood.
         sigma = numpyro.sample("sigma", Exponential(self.noise_hyper_lambda))
-        numpyro.sample("obs", Normal(mu, sigma), obs=y)
+        numpyro.sample("obs", Normal(mu, sigma), obs=x[:, :n_targets])
 
     def _run_mcmc(self, x, y, **kwargs):
         # set up a jax random key.
@@ -151,7 +161,9 @@ class SBR(BaseOptimizer):
         rng_key = random.PRNGKey(seed)
 
         # run the MCMC
-        kernel = NUTS(self._numpyro_model)
+        kernel = NUTS(
+            self._numpyro_model, init_strategy=init_to_value(values=self.init)
+        )
         mcmc = MCMC(
             kernel, num_warmup=self.num_warmup, num_samples=self.num_samples, **kwargs
         )
@@ -169,3 +181,30 @@ def _sample_reg_horseshoe(tau, c_sq, shape):
         Normal(jnp.zeros_like(lamb_squiggle), jnp.sqrt(lamb_squiggle**2 * tau**2)),
     )
     return beta
+
+
+class DiffraxModel:
+    def __init__(self, **kwargs):
+        self.term = ODETerm(self.dxdt)
+        self.solver = Tsit5()
+
+        self.dt = kwargs.pop("dt", 0.1)
+        self.kwargs = kwargs
+
+    def solve(self, y0, t, beta):
+        saveat = SaveAt(ts=t)
+        return diffeqsolve(
+            self.term,
+            self.solver,
+            t0=t[0],
+            t1=t[-1],
+            dt0=self.dt,
+            y0=y0,
+            args=beta,
+            saveat=saveat,
+            **self.kwargs,
+        ).ys
+
+    def dxdt(self, t, x, args):
+        x = jnp.array([1, x[0], x[1], x[0] ** 2, x[0] * x[1], x[1] ** 2])
+        return jnp.dot(x, args.T)
