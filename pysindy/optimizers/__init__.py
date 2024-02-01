@@ -20,7 +20,7 @@ try:  # Waiting on PEP 690 to lazy import cvxpy
 except ImportError:
     pass
 try:
-    from .sbr import SBR
+    from .sbr import SBR, LiteSBR
 except ImportError:
     pass
 from .wrapped_optimizer import WrappedOptimizer
@@ -42,4 +42,5 @@ __all__ = [
     "SINDyPI",
     "MIOSR",
     "SBR",
+    "LiteSBR",
 ]

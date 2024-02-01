@@ -133,7 +133,11 @@ class SBR(BaseOptimizer):
             self.integrator_kwargs = {}
 
     def _pre_fit_hook(self, t, feature_library):
+
+        # internalise the time vector for integrations
         self.t = jnp.array(t[0])
+
+        # internalise the feature library for identifying the state variables.
         self.feature_library = feature_library
 
     def _reduce(self, x, y):
@@ -142,7 +146,7 @@ class SBR(BaseOptimizer):
         self.integrator = DiffraxModel(self.feature_library, **self.integrator_kwargs)
 
         # extract the columns containing the state variables.
-        y = self._sanitize_data(x)
+        y = self._sanitize_data(x, y)
 
         # set up a sparse regression and sample.
         self.mcmc_ = self._run_mcmc(x, y, **self.mcmc_kwargs)
@@ -150,7 +154,7 @@ class SBR(BaseOptimizer):
         # set the mean values as the coefficients.
         self.coef_ = np.array(self.mcmc_.get_samples()["beta"].mean(axis=0))
 
-    def _sanitize_data(self, x):
+    def _sanitize_data(self, x, y):
         if isinstance(
             self.feature_library,
             pysindy.feature_library.polynomial_library.PolynomialLibrary,
@@ -177,11 +181,14 @@ class SBR(BaseOptimizer):
 
         # sample the parameters compute the predicted outputs.
         beta = _sample_reg_horseshoe(tau, c_sq, (n_targets, n_features))
-        mu = self.integrator.solve(y[0, :], t, beta)
+        mu = self._forward(x, t, beta, y[0, :])
 
         # compute the likelihood.
         sigma = numpyro.sample("sigma", Exponential(self.noise_hyper_lambda))
         numpyro.sample("obs", Normal(mu, sigma), obs=y)
+
+    def _forward(self, x, t, beta, y0):
+        return self.integrator.solve(t, beta, y0)
 
     def _run_mcmc(self, x, y, **kwargs):
 
@@ -190,18 +197,20 @@ class SBR(BaseOptimizer):
         key = random.PRNGKey(seed)
 
         # get the initial values if they were provided.
-        initial_values = kwargs.pop("initial_values", None)
-        if initial_values is None:
+        given_initial_values = kwargs.pop("initial_values", None)
+        if given_initial_values is None:
             init_strategy = init_to_sample()
         else:
             # sample the remaining random variables.
             key, subkey = random.split(key)
-            _initial_values = Predictive(
+            sampled_initial_values = Predictive(
                 self._numpyro_model, num_samples=1, batch_ndims=1
             )(subkey, x, y, self.t)
-            _initial_values = {key: value[0] for key, value in _initial_values.items()}
-            _initial_values["beta"] = jnp.array(initial_values)
-            init_strategy = init_to_value(values=_initial_values)
+            sampled_initial_values = {
+                key: value[0] for key, value in sampled_initial_values.items()
+            }
+            initial_values = {**sampled_initial_values, **given_initial_values}
+            init_strategy = init_to_value(values=initial_values)
 
         # run the MCMC
         kernel = NUTS(self._numpyro_model, init_strategy=init_strategy)
@@ -212,6 +221,14 @@ class SBR(BaseOptimizer):
 
         # extract the MCMC samples and compute the UQ-SINDy parameters.
         return mcmc
+
+
+class LiteSBR(SBR):
+    def _forward(self, x, t, beta, y0):
+        return jnp.dot(x, beta.T)
+
+    def _sanitize_data(self, x, y):
+        return y
 
 
 def _sample_reg_horseshoe(tau, c_sq, shape):
@@ -228,8 +245,7 @@ class DiffraxModel:
     def __init__(self, feature_library, **kwargs):
 
         # set the feature library
-        self.feature_library = feature_library
-        self._initialize_feature_library()
+        self.feature_library = ProxyFeatureLibrary(feature_library)
 
         self.term = ODETerm(self.dxdt)
         self.solver = kwargs.pop("solver", Tsit5())
@@ -239,31 +255,7 @@ class DiffraxModel:
         # using PIDController in conjunction with numpyro.infer.MCMC.
         self.stepsize_controller = kwargs.pop("stepsize_controller", ConstantStepSize())
 
-    def _initialize_feature_library(self):
-        # handle PolynomialLibrary.
-        if isinstance(
-            self.feature_library,
-            pysindy.feature_library.polynomial_library.PolynomialLibrary,
-        ):
-            # get the feature combinations
-            _combinations = self.feature_library._combinations(
-                self.feature_library.n_features_in_,
-                self.feature_library.degree,
-                self.feature_library.include_interaction,
-                self.feature_library.interaction_only,
-                self.feature_library.include_bias,
-            )
-            self.combinations = list(_combinations)
-
-            # set the degree of the stability term.
-            if self.feature_library.degree % 2 == 0:
-                self.stability_degree = self.feature_library.degree + 1
-            else:
-                self.stability_degree = self.feature_library.degree + 2
-
-            self._transform = self._transform_polynomial_features
-
-    def solve(self, y0, t, beta):
+    def solve(self, t, beta, y0):
 
         # saveat are the timesteps with measurements.
         saveat = SaveAt(ts=t)
@@ -281,6 +273,40 @@ class DiffraxModel:
             stepsize_controller=self.stepsize_controller,
         ).ys
 
+    def dxdt(self, t, x, args):
+        _x = self.feature_library.transform(x)
+        return jnp.dot(_x, args.T) - 1e-6 * x**self.feature_library.stability_order
+
+
+class ProxyFeatureLibrary:
+    def __init__(self, feature_library):
+
+        self.feature_library = feature_library
+
+        # handle PolynomialLibrary.
+        if isinstance(
+            self.feature_library,
+            pysindy.feature_library.polynomial_library.PolynomialLibrary,
+        ):
+            # get the feature combinations
+            _combinations = self.feature_library._combinations(
+                self.feature_library.n_features_in_,
+                self.feature_library.degree,
+                self.feature_library.include_interaction,
+                self.feature_library.interaction_only,
+                self.feature_library.include_bias,
+            )
+            self.combinations = list(_combinations)
+
+            self.order = self.feature_library.degree
+            self.transform = self._transform_polynomial_features
+
+        # set the degree of the stability term.
+        if self.order % 2 == 0:
+            self.stability_order = self.order + 1
+        else:
+            self.stability_order = self.order + 2
+
     def _transform_polynomial_features(self, x):
         # construct features from the state variables.
         _x = jnp.array(
@@ -290,7 +316,3 @@ class DiffraxModel:
             ]
         )
         return _x
-
-    def dxdt(self, t, x, args):
-        _x = self._transform(x)
-        return jnp.dot(_x, args.T) - 1e-6 * x**self.stability_degree
