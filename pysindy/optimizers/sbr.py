@@ -14,6 +14,7 @@ from numpyro.distributions import InverseGamma
 from numpyro.distributions import Normal
 from numpyro.infer import MCMC
 from numpyro.infer import NUTS
+from numpyro.infer import Predictive
 from numpyro.infer.initialization import init_to_value
 
 from .base import BaseOptimizer
@@ -97,13 +98,12 @@ class SBR(BaseOptimizer):
         num_samples: int = 5000,
         mcmc_kwargs: Optional[dict] = None,
         unbias: bool = False,
-        init: Optional[dict] = None,
         **kwargs,
     ):
 
         if unbias:
             raise ValueError("SBR is incompatible with unbiasing. Set unbias=False")
-
+        self.init = kwargs.pop("init", None)
         super().__init__(unbias=unbias, **kwargs)
 
         self.integrator = DiffraxModel()
@@ -123,8 +123,6 @@ class SBR(BaseOptimizer):
             self.mcmc_kwargs = mcmc_kwargs
         else:
             self.mcmc_kwargs = {}
-
-        self.init = init
 
     def _reduce(self, x, y):
         # set up a sparse regression and sample.
@@ -156,18 +154,28 @@ class SBR(BaseOptimizer):
         numpyro.sample("obs", Normal(mu, sigma), obs=x[:, :n_targets])
 
     def _run_mcmc(self, x, y, **kwargs):
+
         # set up a jax random key.
         seed = kwargs.pop("seed", 0)
-        rng_key = random.PRNGKey(seed)
+        key = random.PRNGKey(seed)
+
+        # init = self.init
+        key, subkey = random.split(key)
+        init = Predictive(self._numpyro_model, num_samples=1, batch_ndims=1)(
+            subkey, x, y
+        )
+        init = {key: value[0] for key, value in init.items()}
+        init["beta"] = self.init["beta"]
+        # init["beta"] = jnp.linalg.lstsq(x, y)[0].T
 
         # run the MCMC
-        kernel = NUTS(
-            self._numpyro_model, init_strategy=init_to_value(values=self.init)
-        )
+        kernel = NUTS(self._numpyro_model, init_strategy=init_to_value(values=init))
         mcmc = MCMC(
             kernel, num_warmup=self.num_warmup, num_samples=self.num_samples, **kwargs
         )
-        mcmc.run(rng_key, x=x, y=y)
+
+        key, subkey = random.split(key)
+        mcmc.run(subkey, x=x, y=y)
 
         # extract the MCMC samples and compute the UQ-SINDy parameters.
         return mcmc
@@ -185,6 +193,7 @@ def _sample_reg_horseshoe(tau, c_sq, shape):
 
 class DiffraxModel:
     def __init__(self, **kwargs):
+
         self.term = ODETerm(self.dxdt)
         self.solver = Tsit5()
 
@@ -206,5 +215,5 @@ class DiffraxModel:
         ).ys
 
     def dxdt(self, t, x, args):
-        x = jnp.array([1, x[0], x[1], x[0] ** 2, x[0] * x[1], x[1] ** 2])
-        return jnp.dot(x, args.T)
+        _x = jnp.array([x[0], x[1], x[0] ** 2, x[0] * x[1], x[1] ** 2])
+        return jnp.dot(_x, args.T) - 1e-5 * x**3
