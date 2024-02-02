@@ -101,6 +101,7 @@ class SBR(BaseOptimizer):
         num_samples: int = 5000,
         mcmc_kwargs: Optional[dict] = None,
         integrator_kwargs: Optional[dict] = None,
+        exact: bool = True,
         unbias: bool = False,
         **kwargs,
     ):
@@ -132,21 +133,37 @@ class SBR(BaseOptimizer):
         else:
             self.integrator_kwargs = {}
 
+        self.exact = exact
+
     def _pre_fit_hook(self, t, feature_library):
 
-        # internalise the time vector for integrations
-        self.t = jnp.array(t[0])
+        if self.exact:
+            # internalise the time vector for integrations
+            self.t = jnp.array(t[0])
 
-        # internalise the feature library for identifying the state variables.
-        self.feature_library = feature_library
+            # internalise the feature library for identifying the state variables.
+            self.feature_library = feature_library
+
+        else:
+            self.t = None
 
     def _reduce(self, x, y):
 
-        # set up the initial value problem solver.
-        self.integrator = DiffraxModel(self.feature_library, **self.integrator_kwargs)
+        if self.exact:
+            # set up the initial value problem solver.
+            self.integrator = DiffraxModel(
+                self.feature_library, **self.integrator_kwargs
+            )
 
-        # extract the columns containing the state variables.
-        y = self._sanitize_data(x, y)
+            # extract the columns containing the state variables.
+            y = self._sanitize_data(x)
+
+            # set the forward method to use the integrator.
+            self.forward = self._forward_exact
+
+        else:
+            # set the forward method to bypass the integrator.
+            self.forward = self._forward_approximate
 
         # set up a sparse regression and sample.
         self.mcmc_ = self._run_mcmc(x, y, **self.mcmc_kwargs)
@@ -154,7 +171,7 @@ class SBR(BaseOptimizer):
         # set the mean values as the coefficients.
         self.coef_ = np.array(self.mcmc_.get_samples()["beta"].mean(axis=0))
 
-    def _sanitize_data(self, x, y):
+    def _sanitize_data(self, x):
         if isinstance(
             self.feature_library,
             pysindy.feature_library.polynomial_library.PolynomialLibrary,
@@ -164,6 +181,12 @@ class SBR(BaseOptimizer):
                 return x[:, 1 : self.feature_library.n_features_in_ + 1]
             else:
                 return x[:, : self.feature_library.n_features_in_]
+
+    def _forward_exact(self, t, x, beta, y0):
+        return self.integrator.solve(t, beta, y0)
+
+    def _forward_approximate(self, t, x, beta, y0):
+        return jnp.dot(x, beta.T)
 
     def _numpyro_model(self, x, y, t):
         # get the dimensionality of the problem.
@@ -181,14 +204,11 @@ class SBR(BaseOptimizer):
 
         # sample the parameters compute the predicted outputs.
         beta = _sample_reg_horseshoe(tau, c_sq, (n_targets, n_features))
-        mu = self._forward(x, t, beta, y[0, :])
+        mu = self.forward(t, x, beta, y[0, :])
 
         # compute the likelihood.
         sigma = numpyro.sample("sigma", Exponential(self.noise_hyper_lambda))
         numpyro.sample("obs", Normal(mu, sigma), obs=y)
-
-    def _forward(self, x, t, beta, y0):
-        return self.integrator.solve(t, beta, y0)
 
     def _run_mcmc(self, x, y, **kwargs):
 
@@ -221,14 +241,6 @@ class SBR(BaseOptimizer):
 
         # extract the MCMC samples and compute the UQ-SINDy parameters.
         return mcmc
-
-
-class LiteSBR(SBR):
-    def _forward(self, x, t, beta, y0):
-        return jnp.dot(x, beta.T)
-
-    def _sanitize_data(self, x, y):
-        return y
 
 
 def _sample_reg_horseshoe(tau, c_sq, shape):
