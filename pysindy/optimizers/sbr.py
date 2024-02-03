@@ -182,10 +182,11 @@ class SBR(BaseOptimizer):
             else:
                 return x[:, : self.feature_library.n_features_in_]
 
-    def _forward_exact(self, t, x, beta, y0):
+    def _forward_exact(self, t, x, beta, y, sigma):
+        y0 = numpyro.sample("y0", Normal(y[0, :], sigma))
         return self.integrator.solve(t, beta, y0)
 
-    def _forward_approximate(self, t, x, beta, y0):
+    def _forward_approximate(self, t, x, beta, y, sigma):
         return jnp.dot(x, beta.T)
 
     def _numpyro_model(self, x, y, t):
@@ -202,12 +203,14 @@ class SBR(BaseOptimizer):
             ),
         )
 
-        # sample the parameters compute the predicted outputs.
+        # sample the SINDy coefficients and the measurement noise standard deviation.
         beta = _sample_reg_horseshoe(tau, c_sq, (n_targets, n_features))
-        mu = self.forward(t, x, beta, y[0, :])
+        sigma = numpyro.sample("sigma", Exponential(self.noise_hyper_lambda))
+
+        # run the respective forward model.
+        mu = self.forward(t, x, beta, y, sigma)
 
         # compute the likelihood.
-        sigma = numpyro.sample("sigma", Exponential(self.noise_hyper_lambda))
         numpyro.sample("obs", Normal(mu, sigma), obs=y)
 
     def _run_mcmc(self, x, y, **kwargs):
