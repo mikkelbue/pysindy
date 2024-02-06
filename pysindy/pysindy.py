@@ -251,7 +251,9 @@ class SINDy(BaseEstimator):
             x = [np.concatenate((xi, ui), axis=xi.ax_coord) for xi, ui in zip(x, u)]
 
         if isinstance(self.optimizer, SBR):
-            self.optimizer._pre_fit_hook(t, self.feature_library)
+            self.optimizer._pre_fit_hook(
+                t, self.feature_library, self.n_control_features_
+            )
 
         steps = [
             ("features", self.feature_library),
