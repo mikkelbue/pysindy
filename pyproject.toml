@@ -62,8 +62,9 @@ cvxpy = [
     "scs>=2.1, !=2.1.4"
 ]
 sbr = [
-    "numpyro~=0.13.2",
-    "jax"
+    "numpyro",
+    "jax",
+    "diffrax"
 ]
 
 [tool.black]
