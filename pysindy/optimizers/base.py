@@ -109,6 +109,9 @@ class BaseOptimizer(LinearRegression, ComplexityMixin):
         self.normalize_columns = normalize_columns
         self.unbias = unbias
 
+    def _pre_fit_hook(self, **kwargs):
+        pass
+
     # Force subclasses to implement this
     @abc.abstractmethod
     def _reduce(self):

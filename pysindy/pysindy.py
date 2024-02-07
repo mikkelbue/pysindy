@@ -23,7 +23,6 @@ try:  # Waiting on PEP 690 to lazy import CVXPY
     sindy_pi_flag = True
 except ImportError:
     sindy_pi_flag = False
-from .optimizers import SBR
 from .optimizers import STLSQ
 from .utils import AxesArray
 from .utils import comprehend_axes
@@ -250,10 +249,7 @@ class SINDy(BaseEstimator):
         if u is not None:
             x = [np.concatenate((xi, ui), axis=xi.ax_coord) for xi, ui in zip(x, u)]
 
-        if isinstance(self.optimizer, SBR):
-            self.optimizer._pre_fit_hook(
-                t, self.feature_library, self.n_control_features_
-            )
+        self.optimizer._pre_fit_hook(t=t, estimator=self)
 
         steps = [
             ("features", self.feature_library),
