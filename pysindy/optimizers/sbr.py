@@ -19,8 +19,10 @@ from numpyro.infer import Predictive
 from numpyro.infer.initialization import init_to_sample
 from numpyro.infer.initialization import init_to_value
 
-import pysindy
+from ..feature_library import PolynomialLibrary
 from .base import BaseOptimizer
+
+COMPATIBLE_FEATURE_LIBRARIES = PolynomialLibrary
 
 
 class SBR(BaseOptimizer):
@@ -153,17 +155,23 @@ class SBR(BaseOptimizer):
 
         self.exact = exact
 
-    def _pre_fit_hook(self, t, feature_library, n_control_features_):
+    def _pre_fit_hook(self, t, estimator):
 
         if self.exact:
             # internalise the time vector for integrations.
             self.t = jnp.array(t[0])
 
             # internalise the feature library for identifying the state variables.
-            self.feature_library = feature_library
+            self.feature_library = estimator.feature_library
 
             # get the number of control features.
-            self.n_control_features_ = n_control_features_
+            self.n_control_features_ = estimator.n_control_features_
+
+            if not isinstance(self.feature_library, COMPATIBLE_FEATURE_LIBRARIES):
+                raise TypeError(
+                    f"{self.feature_library.__class__.__name__} is not compatible"
+                    " with exact SBR optimizer"
+                )
 
         else:
             self.t = None
@@ -180,8 +188,10 @@ class SBR(BaseOptimizer):
             self.n_state_features_ = (
                 self.feature_library.n_features_in_ - self.n_control_features_
             )
-            y = self._extract_state(x)
-            u = self._extract_control(x)
+            y = self._extract_state(x, self.n_state_features_)
+            u = self._extract_control(
+                x, self.n_state_features_, self.n_control_features_
+            )
 
             # set the forward method to use the integrator.
             self.forward = self._forward_exact
@@ -197,37 +207,24 @@ class SBR(BaseOptimizer):
         # set the mean values as the coefficients.
         self.coef_ = np.array(self.mcmc_.get_samples()["beta"].mean(axis=0))
 
-    def _extract_state(self, x):
+    def _extract_state(self, x, ns):
 
-        ns = self.n_state_features_
+        # extract the columns containing the state variables.
+        if self.feature_library.include_bias:
+            return x[:, 1 : 1 + ns]
+        else:
+            return x[:, :ns]
 
-        if isinstance(
-            self.feature_library,
-            pysindy.feature_library.polynomial_library.PolynomialLibrary,
-        ):
-            # extract the columns containing the state variables.
-            if self.feature_library.include_bias:
-                return x[:, 1 : 1 + ns]
-            else:
-                return x[:, :ns]
-
-    def _extract_control(self, x):
+    def _extract_control(self, x, ns, nc):
 
         if self.n_control_features_ == 0:
             return None
 
-        ns = self.n_state_features_
-        nc = self.n_control_features_
-
-        if isinstance(
-            self.feature_library,
-            pysindy.feature_library.polynomial_library.PolynomialLibrary,
-        ):
-            # extract the columns containing the control variables.
-            if self.feature_library.include_bias:
-                return jnp.array(x[:, 1 + ns : 1 + ns + nc])
-            else:
-                return jnp.array(x[:, ns : ns + nc])
+        # extract the columns containing the control variables.
+        if self.feature_library.include_bias:
+            return jnp.array(x[:, 1 + ns : 1 + ns + nc])
+        else:
+            return jnp.array(x[:, ns : ns + nc])
 
     def _forward_exact(self, x, t, y, u, beta, sigma):
         y0 = numpyro.sample("y0", Normal(y[0, :], sigma))
@@ -353,10 +350,7 @@ class ProxyFeatureLibrary:
         self.feature_library = feature_library
 
         # handle PolynomialLibrary.
-        if isinstance(
-            self.feature_library,
-            pysindy.feature_library.polynomial_library.PolynomialLibrary,
-        ):
+        if isinstance(self.feature_library, PolynomialLibrary):
             # get the feature combinations
             _combinations = self.feature_library._combinations(
                 self.feature_library.n_features_in_,
