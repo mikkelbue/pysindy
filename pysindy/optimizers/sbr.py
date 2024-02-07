@@ -33,12 +33,14 @@ class SBR(BaseOptimizer):
 
     The SINDy coefficients are set as the posterior means of the MCMC NUTS samples.
     Additional statistics can be computed from the MCMC samples stored in
-    the mcmc_ attribute using e.g. ArviZ.
+    the mcmc attribute using e.g. ArviZ.
 
     This implementation differs from the method described in Hirsh et al. (2021)
     by imposing the error model directly on the derivatives, rather than on the
     states, circumventing the need to integrate the equation to evaluate the
-    posterior density.
+    posterior density. One consequence of this is that the noise standard
+    deviation "sigma" is with respect to the derivatives instead of the states
+    and hence should not be interpreted.
 
     TODO: Implement the data-generating model described in eq. 2.4 of Hirsh
     et al. (2021). This could be achieved using the JAX-based solver "diffrax".
@@ -110,6 +112,22 @@ class SBR(BaseOptimizer):
             raise ValueError("SBR is incompatible with unbiasing. Set unbias=False")
 
         super().__init__(unbias=unbias, **kwargs)
+
+        # check that hyperparameters are positive.
+        if sparsity_coef_tau0 <= 0:
+            raise ValueError("sparsity_coef_tau0 must be positive")
+        if slab_shape_nu <= 0:
+            raise ValueError("slab_shape_nu must be positive")
+        if slab_shape_s <= 0:
+            raise ValueError("slab_shape_s must be positive")
+        if noise_hyper_lambda <= 0:
+            raise ValueError("noise_hyper_lambda must be positive")
+
+        # check that samples are positive integers.
+        if not isinstance(num_warmup, int) or num_warmup < 0:
+            raise ValueError("num_warmup must be a positive integer")
+        if not isinstance(num_samples, int) or num_samples < 0:
+            raise ValueError("num_samples must be a positive integer")
 
         # set the hyperparameters
         self.sparsity_coef_tau0 = sparsity_coef_tau0

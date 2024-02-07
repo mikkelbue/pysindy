@@ -1,6 +1,8 @@
 """
 Unit tests for optimizers.
 """
+import pickle
+
 import numpy as np
 import pytest
 from numpy.linalg import norm
@@ -22,6 +24,7 @@ from pysindy.optimizers import ConstrainedSR3
 from pysindy.optimizers import EnsembleOptimizer
 from pysindy.optimizers import FROLS
 from pysindy.optimizers import MIOSR
+from pysindy.optimizers import SBR
 from pysindy.optimizers import SINDyPI
 from pysindy.optimizers import SR3
 from pysindy.optimizers import SSR
@@ -77,6 +80,7 @@ class DummyModelNoCoef(BaseEstimator):
         (StableLinearSR3, True),
         (TrappingSR3, True),
         (DummyLinearModel, False),
+        (SBR, True),
     ],
 )
 def test_supports_multiple_targets(cls, support):
@@ -103,6 +107,7 @@ def data(request):
         ElasticNet(fit_intercept=False),
         DummyLinearModel(),
         MIOSR(),
+        SBR(),
     ],
 )
 def test_fit(data_derivative_1d, optimizer):
@@ -122,14 +127,14 @@ def test_fit(data_derivative_1d, optimizer):
 
 @pytest.mark.parametrize(
     "optimizer",
-    [STLSQ(), SSR(), SSR(criteria="model_residual"), FROLS(), SR3(), MIOSR()],
+    [STLSQ(), SSR(), SSR(criteria="model_residual"), FROLS(), SR3(), MIOSR(), SBR()],
 )
 def test_not_fitted(optimizer):
     with pytest.raises(NotFittedError):
         optimizer.predict(np.ones((1, 3)))
 
 
-@pytest.mark.parametrize("optimizer", [STLSQ(), SR3()])
+@pytest.mark.parametrize("optimizer", [STLSQ(), SR3(), SBR()])
 def test_complexity_not_fitted(optimizer, data_derivative_2d):
     with pytest.raises(NotFittedError):
         optimizer.complexity
@@ -321,6 +326,39 @@ def test_sindypi_fit(params):
     )
     model.fit(x_train, t=t)
     assert np.shape(opt.coef_) == (10, 10)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        dict(sparsity_coef_tau0=0),
+        dict(sparsity_coef_tau0=-1),
+        dict(slab_shape_nu=0),
+        dict(slab_shape_nu=-1),
+        dict(slab_shape_s=0),
+        dict(slab_shape_s=-1),
+        dict(noise_hyper_lambda=0),
+        dict(noise_hyper_lambda=-1),
+        dict(num_warmup=0.5),
+        dict(num_warmup=-1),
+        dict(num_samples=0.5),
+        dict(num_samples=-1),
+    ],
+)
+def test_sbr_bad_parameters(params):
+    with pytest.raises(ValueError):
+        SBR(**params)
+
+
+def test_sbr_fit(data_lorenz):
+    x, t = data_lorenz
+    opt = SBR(num_warmup=10, num_samples=10)
+    sindy = SINDy(optimizer=opt).fit(x=x, t=t)
+    assert hasattr(sindy.optimizer, "mcmc_")
+
+    expected_names = ["beta", "c_sq", "lambda", "sigma", "tau"]
+    result_names = sindy.optimizer.mcmc_.get_samples().keys()
+    assert all(expected in result_names for expected in expected_names)
 
 
 @pytest.mark.parametrize(
@@ -587,7 +625,7 @@ def test_specific_bad_parameters(error, optimizer, params, data_lorenz):
 def test_bad_optimizers(data_derivative_1d):
     x, x_dot = data_derivative_1d
     x = x.reshape(-1, 1)
-
+    x_dot = x_dot.reshape(-1, 1)
     with pytest.raises(InvalidParameterError):
         # Error: optimizer does not have a callable fit method
         opt = WrappedOptimizer(DummyEmptyModel())
@@ -665,6 +703,7 @@ def test_constrained_sr3_prox_functions(data_derivative_1d, thresholder):
         (StableLinearSR3, {"trimming_fraction": 0.1}),
         (SINDyPI, {}),
         (MIOSR, {"constraint_lhs": [1]}),
+        (SBR, {}),
     ),
 )
 def test_illegal_unbias(data_derivative_1d, opt_cls, opt_args):
@@ -986,6 +1025,7 @@ def test_inequality_constraints_reqs():
         StableLinearSR3,
         TrappingSR3,
         MIOSR,
+        SBR,
     ],
 )
 def test_normalize_columns(data_derivative_1d, optimizer):
@@ -1129,3 +1169,20 @@ def test_remove_and_decrement():
         existing_vals=existing_vals, vals_to_remove=vals_to_remove
     )
     np.testing.assert_array_equal(expected, result)
+
+
+@pytest.mark.parametrize(
+    ("opt_cls", "opt_args"),
+    (
+        (MIOSR, {"target_sparsity": 7}),
+        (SBR, {"num_warmup": 10, "num_samples": 10}),
+    ),
+)
+def test_pickle(data_lorenz, opt_cls, opt_args):
+    x, t = data_lorenz
+    y = PolynomialLibrary(degree=2).fit_transform(x)
+    opt = opt_cls(**opt_args).fit(x, y)
+    expected = opt.coef_
+    new_opt = pickle.loads(pickle.dumps(opt))
+    result = new_opt.coef_
+    np.testing.assert_array_equal(result, expected)
