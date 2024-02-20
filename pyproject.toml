@@ -64,7 +64,9 @@ cvxpy = [
 sbr = [
     "numpyro",
     "jax",
-    "diffrax"]
+    "diffrax",
+    "arviz"
+]
 
 [tool.black]
 line-length = 88

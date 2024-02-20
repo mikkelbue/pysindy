@@ -1,4 +1,5 @@
 from typing import Optional
+from typing import Tuple
 
 import jax.numpy as jnp
 import numpy as np
@@ -31,7 +32,9 @@ class SBR(BaseOptimizer):
     horseshoe prior over the SINDy coefficients to achieve sparsification.
 
     The horseshoe prior contains a "spike" of nonzero probability at the
-    origin, and a "slab" of distribution in cases where a coefficient is nonzero.
+    origin, and a Student's-T-shaped "slab" of distribution in cases where a
+    coefficient is nonzero.
+
 
     The SINDy coefficients are set as the posterior means of the MCMC NUTS samples.
     Additional statistics can be computed from the MCMC samples stored in
@@ -62,14 +65,14 @@ class SBR(BaseOptimizer):
         value increases the sparsity of the SINDy coefficients.
 
     slab_shape_nu : float, optional (default 4)
-        Controls spread of slab.  For values less than 4,
-        the kurtosis of of nonzero coefficients is undefined.  As  the value
-        increases past 4, for higher values, the variance and kurtosis approach
-        :math:`s` and :math:`s^2`, respectively
+        Along with ``slab_shape_s``, controls tails of nonzero coefficients.
+        Specifically, degrees of freedom for Student's-T-shaped slab.
+        Higher values decrease excess kurtosis to zero, lower values >= 4
+        increase kurtosis to infinity.
 
     slab_shape_s : float, optional (default 2)
-        Controls spread of slab.  Higher values lead to more spread
-        out nonzero coefficients.
+        Along with ``slab_shape_nu``, controls standard deviation of nonzero
+        coefficients.
 
     noise_hyper_lambda : float, optional (default 1)
         Rate hyperparameter for the exponential prior distribution over
@@ -290,7 +293,20 @@ class SBR(BaseOptimizer):
         return mcmc
 
 
-def _sample_reg_horseshoe(tau, c_sq, shape):
+def _sample_reg_horseshoe(tau: float, c_sq: float, shape: Tuple[int, ...]):
+    """Create a regularized horseshoe distribution
+
+    The regularized horseshoe distribution behaves like a horseshoe prior when
+    shrinkage ``lamb`` is small, but behaves like a gaussian slab of variance
+    ``c_sq`` when ``lamb`` is big or a Student T-slab when ``c_sq`` is itself
+    an inverse Gamma.
+
+    For original work, including interpretation of the coefficients, see:
+
+    Piironen, J., and Vehtari, A. (2017). Sparsity Information and
+    Regularization in the Horseshoe and Other Shrinkage Priors. Electronic Journal
+    of Statistics Vol. 11 pp 5018-5051. https://doi.org/10.1214/17-EJS1337SI
+    """
     lamb = numpyro.sample("lambda", HalfCauchy(1.0), sample_shape=shape)
     lamb_squiggle = jnp.sqrt(c_sq) * lamb / jnp.sqrt(c_sq + tau**2 * lamb**2)
     beta = numpyro.sample(
