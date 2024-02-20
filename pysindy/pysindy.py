@@ -249,6 +249,8 @@ class SINDy(BaseEstimator):
         if u is not None:
             x = [np.concatenate((xi, ui), axis=xi.ax_coord) for xi, ui in zip(x, u)]
 
+        self.optimizer._pre_fit_hook(t=t, estimator=self)
+
         steps = [
             ("features", self.feature_library),
             ("shaping", SampleConcatter()),

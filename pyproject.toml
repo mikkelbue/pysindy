@@ -64,6 +64,7 @@ cvxpy = [
 sbr = [
     "numpyro",
     "jax",
+    "diffrax",
     "arviz"
 ]
 

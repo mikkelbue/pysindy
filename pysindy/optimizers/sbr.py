@@ -4,6 +4,11 @@ from typing import Tuple
 import jax.numpy as jnp
 import numpy as np
 import numpyro
+from diffrax import ConstantStepSize
+from diffrax import diffeqsolve
+from diffrax import ODETerm
+from diffrax import SaveAt
+from diffrax import Tsit5
 from jax import random
 from numpyro.distributions import Exponential
 from numpyro.distributions import HalfCauchy
@@ -11,8 +16,14 @@ from numpyro.distributions import InverseGamma
 from numpyro.distributions import Normal
 from numpyro.infer import MCMC
 from numpyro.infer import NUTS
+from numpyro.infer import Predictive
+from numpyro.infer.initialization import init_to_sample
+from numpyro.infer.initialization import init_to_value
 
+from ..feature_library import PolynomialLibrary
 from .base import BaseOptimizer
+
+COMPATIBLE_FEATURE_LIBRARIES = PolynomialLibrary
 
 
 class SBR(BaseOptimizer):
@@ -96,6 +107,8 @@ class SBR(BaseOptimizer):
         num_warmup: int = 1000,
         num_samples: int = 5000,
         mcmc_kwargs: Optional[dict] = None,
+        integrator_kwargs: Optional[dict] = None,
+        exact: bool = True,
         unbias: bool = False,
         **kwargs,
     ):
@@ -137,14 +150,93 @@ class SBR(BaseOptimizer):
         else:
             self.mcmc_kwargs = {}
 
+        # set the integrator kwargs.
+        if integrator_kwargs is not None:
+            self.integrator_kwargs = integrator_kwargs
+        else:
+            self.integrator_kwargs = {}
+
+        self.exact = exact
+
+    def _pre_fit_hook(self, t, estimator):
+
+        if self.exact:
+            # internalise the time vector for integrations.
+            self.t = jnp.array(t[0])
+
+            # internalise the feature library for identifying the state variables.
+            self.feature_library = estimator.feature_library
+
+            # get the number of control features.
+            self.n_control_features_ = estimator.n_control_features_
+
+            if not isinstance(self.feature_library, COMPATIBLE_FEATURE_LIBRARIES):
+                raise TypeError(
+                    f"{self.feature_library.__class__.__name__} is not compatible"
+                    " with exact SBR optimizer"
+                )
+
+        else:
+            self.t = None
+
     def _reduce(self, x, y):
+
+        if self.exact:
+            # set up the initial value problem solver.
+            self.integrator = DiffraxModel(
+                self.feature_library, **self.integrator_kwargs
+            )
+
+            # extract the columns containing the state and control variables.
+            self.n_state_features_ = (
+                self.feature_library.n_features_in_ - self.n_control_features_
+            )
+            y = self._extract_state(x, self.n_state_features_)
+            u = self._extract_control(
+                x, self.n_state_features_, self.n_control_features_
+            )
+
+            # set the forward method to use the integrator.
+            self.forward = self._forward_exact
+
+        else:
+            # set the forward method to bypass the integrator.
+            self.forward = self._forward_approximate
+            u = None
+
         # set up a sparse regression and sample.
-        self.mcmc_ = self._run_mcmc(x, y, **self.mcmc_kwargs)
+        self.mcmc_ = self._run_mcmc(x, y, u, **self.mcmc_kwargs)
 
         # set the mean values as the coefficients.
         self.coef_ = np.array(self.mcmc_.get_samples()["beta"].mean(axis=0))
 
-    def _numpyro_model(self, x, y):
+    def _extract_state(self, x, ns):
+
+        # extract the columns containing the state variables.
+        if self.feature_library.include_bias:
+            return x[:, 1 : 1 + ns]
+        else:
+            return x[:, :ns]
+
+    def _extract_control(self, x, ns, nc):
+
+        if self.n_control_features_ == 0:
+            return None
+
+        # extract the columns containing the control variables.
+        if self.feature_library.include_bias:
+            return jnp.array(x[:, 1 + ns : 1 + ns + nc])
+        else:
+            return jnp.array(x[:, ns : ns + nc])
+
+    def _forward_exact(self, x, t, y, u, beta, sigma):
+        y0 = numpyro.sample("y0", Normal(y[0, :], sigma))
+        return self.integrator.solve(t, y0, u, beta)
+
+    def _forward_approximate(self, x, t, y, u, beta, sigma):
+        return jnp.dot(x, beta.T)
+
+    def _numpyro_model(self, x, t, y, u):
         # get the dimensionality of the problem.
         n_features = x.shape[1]
         n_targets = y.shape[1]
@@ -158,25 +250,44 @@ class SBR(BaseOptimizer):
             ),
         )
 
-        # sample the parameters compute the predicted outputs.
+        # sample the SINDy coefficients and the measurement noise standard deviation.
         beta = _sample_reg_horseshoe(tau, c_sq, (n_targets, n_features))
-        mu = jnp.dot(x, beta.T)
+        sigma = numpyro.sample("sigma", Exponential(self.noise_hyper_lambda))
+
+        # run the respective forward model.
+        mu = self.forward(x, t, y, u, beta, sigma)
 
         # compute the likelihood.
-        sigma = numpyro.sample("sigma", Exponential(self.noise_hyper_lambda))
         numpyro.sample("obs", Normal(mu, sigma), obs=y)
 
-    def _run_mcmc(self, x, y, **kwargs):
+    def _run_mcmc(self, x, y, u, **kwargs):
+
         # set up a jax random key.
         seed = kwargs.pop("seed", 0)
-        rng_key = random.PRNGKey(seed)
+        key = random.PRNGKey(seed)
+
+        # get the initial values if they were provided.
+        given_initial_values = kwargs.pop("initial_values", None)
+        if given_initial_values is None:
+            init_strategy = init_to_sample()
+        else:
+            # sample the remaining random variables.
+            key, subkey = random.split(key)
+            sampled_initial_values = Predictive(
+                self._numpyro_model, num_samples=1, batch_ndims=1
+            )(subkey, x, self.t, y, u)
+            sampled_initial_values = {
+                key: value[0] for key, value in sampled_initial_values.items()
+            }
+            initial_values = {**sampled_initial_values, **given_initial_values}
+            init_strategy = init_to_value(values=initial_values)
 
         # run the MCMC
-        kernel = NUTS(self._numpyro_model)
+        kernel = NUTS(self._numpyro_model, init_strategy=init_strategy)
         mcmc = MCMC(
             kernel, num_warmup=self.num_warmup, num_samples=self.num_samples, **kwargs
         )
-        mcmc.run(rng_key, x=x, y=y)
+        mcmc.run(key, x=x, t=self.t, y=y, u=u)
 
         # extract the MCMC samples and compute the UQ-SINDy parameters.
         return mcmc
@@ -203,3 +314,84 @@ def _sample_reg_horseshoe(tau: float, c_sq: float, shape: Tuple[int, ...]):
         Normal(jnp.zeros_like(lamb_squiggle), jnp.sqrt(lamb_squiggle**2 * tau**2)),
     )
     return beta
+
+
+class DiffraxModel:
+    def __init__(self, feature_library, **kwargs):
+
+        # set the feature library
+        self.feature_library = ProxyFeatureLibrary(feature_library)
+
+        self.term = ODETerm(self.dxdt)
+        self.solver = kwargs.pop("solver", Tsit5())
+        self.dt = kwargs.pop("dt", 0.1)
+
+        # there is a strange bug that raises a XlaRuntimeError when
+        # using PIDController in conjunction with numpyro.infer.MCMC.
+        self.stepsize_controller = kwargs.pop("stepsize_controller", ConstantStepSize())
+
+    def solve(self, t, y0, u, beta):
+
+        # saveat are the timesteps with measurements.
+        saveat = SaveAt(ts=t)
+
+        if u is not None:
+            self.u = [lambda _t: jnp.interp(_t, t, _u) for _u in u.T]
+        else:
+            self.u = []
+
+        # run the Diffrax solver and return the y-values.
+        return diffeqsolve(
+            self.term,
+            self.solver,
+            t0=t[0],
+            t1=t[-1],
+            dt0=self.dt,
+            y0=y0,
+            args=beta,
+            saveat=saveat,
+            stepsize_controller=self.stepsize_controller,
+        ).ys
+
+    def dxdt(self, t, x, args):
+        u = jnp.array([_u(t) for _u in self.u])
+        _x = jnp.hstack((x, u))
+        _x = self.feature_library.transform(_x)
+        return jnp.dot(_x, args.T) - 1e-6 * x**self.feature_library.stability_order
+
+
+class ProxyFeatureLibrary:
+    def __init__(self, feature_library):
+
+        self.feature_library = feature_library
+
+        # handle PolynomialLibrary.
+        if isinstance(self.feature_library, PolynomialLibrary):
+            # get the feature combinations
+            _combinations = self.feature_library._combinations(
+                self.feature_library.n_features_in_,
+                self.feature_library.degree,
+                self.feature_library.include_interaction,
+                self.feature_library.interaction_only,
+                self.feature_library.include_bias,
+            )
+            self.combinations = list(_combinations)
+
+            self.order = self.feature_library.degree
+            self.transform = self._transform_polynomial_features
+
+        # set the degree of the stability term.
+        if self.order % 2 == 0:
+            self.stability_order = self.order + 1
+        else:
+            self.stability_order = self.order + 2
+
+    def _transform_polynomial_features(self, x):
+        # construct features from the state variables.
+        _x = jnp.array(
+            [
+                x[..., self.combinations[i]].prod(-1)
+                for i in range(self.feature_library.n_output_features_)
+            ]
+        )
+        return _x
